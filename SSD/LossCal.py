@@ -13,3 +13,5 @@ def lossSingleLay(Inputs):
     p = []
     l = []
     return p,l
+
+
