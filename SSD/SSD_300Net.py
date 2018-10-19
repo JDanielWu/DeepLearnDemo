@@ -1,5 +1,133 @@
+#codeing = utf8
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
+import numpy as np
+import math
+
+def ssd_anchor_one_layer(image_shape,
+                         feat_shape,
+                         sizes,
+                         ratios,
+                         step,
+                         offset=0.5,
+                         dtype=np.float32):
+    y,x = np.mgrid[0:feat_shape[0], 0:feat_shape[1]]
+
+    y = (y.astype(dtype) + offset) * step / image_shape[0]
+    x = (x.astype(dtype) + offset) * step / image_shape[1]
+    #for what?
+    y = np.expand_dims(y, axis=-1)
+    x = np.expand_dims(x, axis=-1)
+
+    num_anchors = 2 + len(ratios)
+    w = np.zeros(num_anchors, dtype=dtype)
+    h = np.zeros(num_anchors, dtype=dtype)
+
+    w[0] = sizes[0] / image_shape[1]
+    h[0] = sizes[0] / image_shape[0]
+
+    w[1] = math.sqrt(sizes[0]*sizes[1]) / image_shape[1]
+    h[1] = math.sqrt(sizes[0] * sizes[1]) / image_shape[0]
+
+    for i,ratio in enumerate(ratios):
+        w[i+2] = sizes[0] / image_shape[1] / math.sqrt(ratio)
+        h[i + 2] = sizes[0] / image_shape[0] * math.sqrt(ratio)
+    return y,x,h,w
+
+def ssd_anchors_all_layers(img_shape,
+                           layers_shape,
+                           anchor_sizes,
+                           anchor_ratios,
+                           anchor_steps,
+                           offset=0.5,
+                           dtype=np.float32):
+    layers_anchors = []
+    for i,lay_shape in enumerate(layers_shape):
+        anchor_box = ssd_anchor_one_layer(img_shape, lay_shape, anchor_sizes, anchor_ratios, anchor_steps, offset, dtype)
+        layers_anchors.append(anchor_box)
+    return  layers_anchors
+
+#实际上就是求个交并比
+def jaccard_with_anchors(bbox, anchors_layer):
+    #center
+    yref = anchors_layer[0]
+    xref = anchors_layer[1]
+    href = anchors_layer[2]
+    wref = anchors_layer[3]
+    #left top
+    ymin = yref - href/2
+    xmin = xref - wref/2
+    #right bottom
+    ymax = yref + href/2
+    xmax = xref + wref / 2
+
+    vol_anchors = href*wref
+
+    y_jmin = tf.maximum(ymin, bbox[0])
+    x_jmin = tf.maximum(xmin, bbox[1])
+
+    y_jmax = tf.minimum(ymax, bbox[2])
+    x_jmax = tf.minimum(xmax, bbox[3])
+
+    h = tf.maximum(y_jmax - y_jmin, 0)
+    w = tf.maximum(x_jmax - x_jmin, 0)
+    #交集面积
+    vol_j = h*w
+    #并集面积，这里使用了一点小技巧，并集面积 = 2部分面积和 - 交集
+    vol_union =vol_anchors +(bbox[2]-bbox[0])*(bbox[3]-bbox[1]) - vol_j
+    return tf.div(vol_j, vol_union)
+
+def intersection_with_anchors(bbox, anchors_layer):
+    #center
+    yref = anchors_layer[0]
+    xref = anchors_layer[1]
+    href = anchors_layer[2]
+    wref = anchors_layer[3]
+    #left top
+    ymin = yref - href/2
+    xmin = xref - wref/2
+    #right bottom
+    ymax = yref + href/2
+    xmax = xref + wref / 2
+
+    vol_anchors = href*wref
+
+    y_jmin = tf.maximum(ymin, bbox[0])
+    x_jmin = tf.maximum(xmin, bbox[1])
+
+    y_jmax = tf.minimum(ymax, bbox[2])
+    x_jmax = tf.minimum(xmax, bbox[3])
+
+    h = tf.maximum(y_jmax - y_jmin, 0)
+    w = tf.maximum(x_jmax - x_jmin, 0)
+    #交集面积
+    vol_j = h*w
+    return tf.div(vol_j, vol_anchors)
+
+def ssd_bboxes_encode_layer(labels,
+                            bboxes,
+                            anchors_layer,
+                            num_classes,
+                            no_annotation_label,
+                            ignore_threshold=0.5,
+                            prior_scaling=[0.1, 0.1, 0.2, 0.2],
+                            dtype=tf.float32):
+    #center
+    yref = anchors_layer[0]
+    xref = anchors_layer[1]
+    href = anchors_layer[2]
+    wref = anchors_layer[3]
+    #left top
+    ymin = yref - href/2
+    xmin = xref - wref/2
+    #right bottom
+    ymax = yref + href/2
+    xmax = xref + wref / 2
+
+    vol_anchors = href*wref
+
+
+
 
 def pad2d(Input, padSize):
     net = tf.pad(Input, [[0,0], [padSize[0],padSize[0]], [padSize[1],padSize[1]], [0,0]])
@@ -106,7 +234,6 @@ def ssd_300Net(Input, num_classes,
             predictions.append(prediction_fn(p))
             logits.append(p)
             localisations.append(l)
-
 
     return predictions, localisations, logits, end_points
 
