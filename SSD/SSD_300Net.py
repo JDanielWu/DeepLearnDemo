@@ -104,6 +104,36 @@ def intersection_with_anchors(bbox, anchors_layer):
     vol_j = h*w
     return tf.div(vol_j, vol_anchors)
 
+def condition(i, labels):
+    r = tf.less(i, tf.shape(labels))
+    return r[0]
+
+#这个函数的主要用处：获取每一层锚点框和真实样本框的交并比，当交并比大于
+#阈值的时候，就筛选出来，并通过后续遍历所有真实框，获取一个最大的交并比的锚点框的
+#位置
+def body(i, anchors_layer, labels, bboxes, num_classes, feat_labels, feat_scores,
+                  feat_ymin, feat_xmin, feat_ymax, feat_xmax):
+    label = labels[i]
+    bbox = bboxes[i]
+    jaccard_value = jaccard_with_anchors(bbox, anchors_layer)
+    #其实是和上一次做比较
+    mask = tf.greater(jaccard_value, feat_scores)
+    mask = tf.logical_and(mask, feat_scores>-0.5)
+    mask = tf.logical_and(mask, label<num_classes)
+    imask = tf.cast(mask, tf.int64)
+    fmask = tf.cast(mask, tf.float32)
+
+    #如果交并比比之前大，则选出来，否则保持原值
+    feat_labels = imask * label + (1-imask)*feat_labels
+    feat_scores = imask*jaccard_value + (1-imask)*feat_scores
+
+    feat_ymin = fmask*bbox[0] + (1-fmask)*feat_ymin
+    feat_xmin = fmask * bbox[1] + (1 - fmask) * feat_xmin
+    feat_ymax = fmask * bbox[2] + (1 - fmask) * feat_ymax
+    feat_xmax = fmask * bbox[3] + (1 - fmask) * feat_xmax
+
+    return [i+1, feat_labels, feat_scores, feat_ymin, feat_xmin, feat_ymax, feat_xmax]
+
 def ssd_bboxes_encode_layer(labels,
                             bboxes,
                             anchors_layer,
@@ -126,7 +156,35 @@ def ssd_bboxes_encode_layer(labels,
 
     vol_anchors = href*wref
 
+    shape = (yref.shape[0],  yref.shape[1], href.size)
 
+    feat_labels = tf.zeros(shape, tf.int64)
+    feat_scores = tf.zeros(shape, dtype)
+    feat_ymin = tf.zeros(shape, dtype)
+    feat_xmin = tf.zeros(shape, dtype)
+    feat_ymax = tf.zeros(shape, dtype)
+    feat_xmax = tf.zeros(shape, dtype)
+
+    i = 0
+    [i, feat_labels, feat_scores,
+     feat_ymin, feat_xmin,
+     feat_ymax, feat_xmax] = tf.while_loop(condition, body,
+                                           [i, anchors_layer, labels,
+                                            bboxes, num_classes,
+                                            feat_labels, feat_scores,
+                                            feat_ymin, feat_xmin,
+                                            feat_ymax, feat_xmax])
+    feat_cy = (feat_ymax + feat_ymin) / 2
+    feat_cx = (feat_xmax + feat_xmin) / 2
+    feat_h = feat_ymax - feat_ymin
+    feat_w = feat_xmax - feat_xmin
+
+    feat_cy = (feat_cy - yref)/ href /prior_scaling[0]
+    feat_cx = (feat_cx - xref) / wref / prior_scaling[1]
+    feat_h = tf.log(feat_h / href) / prior_scaling[2]
+    feat_w = tf.log(feat_w / wref) / prior_scaling[3]
+    feat_localizations = tf.stack([feat_cx, feat_cy, feat_w, feat_h], axis=-1)
+    return feat_labels, feat_localizations, feat_scores
 
 
 def pad2d(Input, padSize):
