@@ -295,3 +295,98 @@ def ssd_300Net(Input, num_classes,
 
     return predictions, localisations, logits, end_points
 
+#和Git 版本不一致，按原算法实现
+def Smo_L1_loss(x):
+    if tf.abs(x)<1:
+        r = tf.div(tf.square(x),2)
+    else :
+        r = tf.abs(x) - 0.5
+    return r
+
+def loss(logits, localisations,
+         gclasses, glocalisations, gscores,
+         match_threshold=0.5,
+         negative_ratio=3.,
+         alpha=1.,
+         label_smoothing=0.,
+         scope=None):
+
+    #logits保存了每一层的值
+    lshape = logits.get_shape().as_list()
+    num_classes = lshape[-1]
+    batch_size = lshape[0]
+    #这里把所有的tensor进行了平铺处理，
+    #我感觉只是为了方便理解
+    flogits = []
+    fgclasses = []
+    fgscores = []
+    flocalisations = []
+    fglocalisations = []
+    for i in range(logits):
+        #把每一层的b，h,w，组成一个维度
+        flogits.append(tf.reshape(logits, [-1, num_classes]))
+        flocalisations.append(tf.reshape(localisations, [-1, 4]))
+
+        fgclasses.append(tf.reshape(gclasses, [-1]))
+        fgscores.append(tf.reshape(gscores, [-1]))
+        fglocalisations.append(tf.reshape(glocalisations, [-1, 4]))
+
+    #再把所有层的值，组到一起，现在的数据格式应该是[锚点框，锚点框，锚点框...]
+    logits = tf.concat(flogits, axis=0)
+    localisations = tf.concat(flocalisations, axis=0)
+
+    gclasses = tf.concat(fgclasses, axis=0)
+    gscores = tf.concat(fgscores, axis=0)
+    glocalisations = tf.concat(fglocalisations, axis=0)
+
+    dtype = logits.dtype
+    pmask = gscores[i] > match_threshold
+    #no_classes 主要是给负样本用的，负样本就是一个0,1二分类，1就是有分类，0就是背景
+    no_classes = tf.cast(pmask, tf.int32)
+    fpmask = tf.cast(pmask, dtype)
+    #正样本的个数
+    n_positives = tf.reduce_sum(fpmask)
+
+    #负样本经过2次筛选，第一次是交并比要大于-0.5，不能太小，也就是-0.5-0.5
+    nmask = tf.logical_and(tf.logical_not(pmask), gscores[i]>-0.5)
+    fnmask = tf.cast(nmask, dtype)
+    max_neg_entries = tf.cast(tf.reduce_sum(fnmask), tf.int32)
+    #为什么要加batch_size？？
+    n_neg = tf.cast(n_positives*negative_ratio, tf.int32) + batch_size
+    n_neg = tf.minimum(n_neg, max_neg_entries)
+
+    #负样本第二次筛选，选择预测置信度低的top n_neg
+    predictions  = slim.softmax(logits)
+    #取出属于背景的分类预测值
+    nvalues = tf.where(nmask, predictions[:,0], 1.- fnmask)
+    #前面不是已经平铺了吗？这边为什么还要平铺，代码运行的时候，把shape打印出来
+    nvalues_flat = tf.reshape(nvalues, [-1])
+    #一段是关于hard-negative mining原则的理解：
+    #目标检测的过程中，负样本肯定比正样本多的多，那怎么样的负样本才是对我们训练更有用的呢，
+    #或者说让后续的预测分类更有效。直观上，如果能把一个不太好区分的负样本，正确分类，那这个
+    #分类器就是有效的。怎么样算，不太好区分呢，那就是这个负样本预测框，预测是背景的概率比较低
+    #但实际上却是是背景的。所以我们要把这类负样本挑出来做训练
+    val,index = tf.nn.top_k(-nvalues_flat, n_neg)
+    max_hard_pre = -val[-1]
+
+    #第二次筛选
+    # Final negative mask.
+    nmask = tf.logical_and(nmask, nvalues<max_hard_pre)
+    fnmask = tf.cast(nmask, dtype)
+
+    #计算分类loss，正样本
+    with tf.name_scope('cross_entropy_pos'):
+        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=gclasses)
+        loss = tf.div(tf.reduce_sum(loss*fpmask), batch_size)
+        tf.losses.add_loss(loss)
+    # 计算分类loss，负样本
+    with tf.name_scope('cross_entropy_neg'):
+        loss = tf.nn.sparse_softmax_cross_entropy_with_logits(logits=logits, labels=no_classes)
+        loss = tf.div(tf.reduce_sum(loss * fnmask), batch_size)
+        tf.losses.add_loss(loss)
+    #计算位置loss
+    with tf.name_scope('localization'):
+        weights = tf.expand_dims(alpha * fpmask, axis=-1)
+        loss = Smo_L1_loss(localisations - glocalisations)
+        loss = tf.div(tf.reduce_sum(loss * weights), batch_size, name='value')
+        tf.losses.add_loss(loss)
