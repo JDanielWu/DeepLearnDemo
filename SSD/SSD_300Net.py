@@ -138,7 +138,6 @@ def ssd_bboxes_encode_layer(labels,
                             bboxes,
                             anchors_layer,
                             num_classes,
-                            no_annotation_label,
                             ignore_threshold=0.5,
                             prior_scaling=[0.1, 0.1, 0.2, 0.2],
                             dtype=tf.float32):
@@ -191,8 +190,22 @@ def pad2d(Input, padSize):
     net = tf.pad(Input, [[0,0], [padSize[0],padSize[0]], [padSize[1],padSize[1]], [0,0]])
     return net
 
-def tensor_shape(x):
-    return x.get_shape().as_list()
+def tensor_shape(x, rank=3):
+    """Returns the dimensions of a tensor.
+    Args:
+      image: A N-D Tensor of shape.
+    Returns:
+      A list of dimensions. Dimensions that are statically known are python
+        integers,otherwise they are integer scalar tensors.
+    """
+    if x.get_shape().is_fully_defined():
+        return x.get_shape().as_list()
+    else:
+        static_shape = x.get_shape().with_rank(rank).as_list()
+        dynamic_shape = tf.unstack(tf.shape(x), rank)
+        return [s if s is not None else d
+                for s, d in zip(static_shape, dynamic_shape)]
+
 
 def ssd_multibox_layer(inputs,
                        num_classes,
@@ -210,11 +223,11 @@ def ssd_multibox_layer(inputs,
     #use for what?
     #Get it: after conv_loc, feat shape is [H ,W , num_location]
     #But for easy division, reshape to [H,W,num_anchors, 4]
-    loc_pred = tf.reshape(loc_pred, tensor_shape(loc_pred)[:-1] + [num_anchors, 4])
+    loc_pred = tf.reshape(loc_pred, tensor_shape(loc_pred,4)[:-1] + [num_anchors, 4])
 
     #predict class
     cls_pred = slim.conv2d(inputs, num_anchors*num_classes, [3,3], activation_fn=None, scope='conv_cls')
-    cls_pred = tf.reshape(cls_pred, tensor_shape(cls_pred)[:-1] + [num_anchors, num_classes])
+    cls_pred = tf.reshape(cls_pred, tensor_shape(cls_pred,4)[:-1] + [num_anchors, num_classes])
 
     return cls_pred, loc_pred
 
@@ -223,77 +236,88 @@ def ssd_300Net(Input, num_classes,
                feat_layers,
                dropout_keep_prob=0.5,
                is_training=True,
-               prediction_fn=slim.softmax):
+               prediction_fn=slim.softmax,
+               reuse=None,
+               scope='ssd_300_vgg'):
     end_points = {}
-    #block1
-    net = slim.repeat(2, Input, slim.conv2d, 64, [3,3], scope='conv1')
-    end_points['block1'] = net
-    net = slim.max_pool2d(net, [2,2], scope='pool1')
+    with tf.variable_scope(scope, 'ssd_300_vgg', [Input], reuse=reuse):
+        #block1
+        net = slim.repeat(Input, 2, slim.conv2d, 64, [3,3], scope='conv1')
+        end_points['block1'] = net
+        net = slim.max_pool2d(net, [2,2], scope='pool1')
 
-    #block2
-    net = slim.repeat(2, net, slim.conv2d, 128, [3, 3], scope='conv2')
-    end_points['block2'] = net
-    net = slim.max_pool2d(net, [2, 2], scope='pool2')
+        #block2
+        net = slim.repeat(net, 2 , slim.conv2d, 128, [3, 3], scope='conv2')
+        end_points['block2'] = net
+        net = slim.max_pool2d(net, [2, 2], scope='pool2')
 
-    #block3
-    net = slim.repeat(3, net, slim.conv2d, 256, [3, 3], scope='conv3')
-    end_points['block3'] = net
-    net = slim.max_pool2d(net, [2, 2], scope='pool3')
+        #block3
+        net = slim.repeat(net, 3, slim.conv2d, 256, [3, 3], scope='conv3')
+        end_points['block3'] = net
+        net = slim.max_pool2d(net, [2, 2], scope='pool3')
 
-    #block4 - out 38x38
-    net = slim.repeat(3, net, slim.conv2d, 512, [3, 3], scope='conv4')
-    end_points['block4'] = net
-    net = slim.max_pool2d(net, [2, 2], scope='pool4')
+        #block4 - out 38x38
+        net = slim.repeat(net, 3, slim.conv2d, 512, [3, 3], scope='conv4')
+        end_points['block4'] = net
+        net = slim.max_pool2d(net, [2, 2], scope='pool4')
 
-    #block5
-    net = slim.repeat(3, net, slim.conv2d, 512, [3, 3], scope='conv5')
-    end_points['block5'] = net
-    net = slim.max_pool2d(net, [3, 3], 1, scope='pool5')
+        #block5
+        net = slim.repeat(net, 3, slim.conv2d, 512, [3, 3], scope='conv5')
+        end_points['block5'] = net
+        net = slim.max_pool2d(net, [3, 3], 1, scope='pool5')
 
-    #block6
-    net = slim.conv2d(net, 1024, [3,3], rate=6, scope='conv6')
-    end_points['block6'] = net
-    net = slim.dropout(net, keep_prob=dropout_keep_prob, training=is_training)
+        #block6
+        net = slim.conv2d(net, 1024, [3,3], rate=6, scope='conv6')
+        end_points['block6'] = net
+        net =  tf.layers.dropout(net, rate=dropout_keep_prob, training=is_training)
 
-    #block7 - out 19x19
-    net = slim.conv2d(net, 1024, [1, 1], scope='conv7')
-    end_points['block7'] = net
-    net = slim.dropout(net, keep_prob=dropout_keep_prob, training=is_training)
+        #block7 - out 19x19
+        net = slim.conv2d(net, 1024, [1, 1], scope='conv7')
+        end_points['block7'] = net
+        net =  tf.layers.dropout(net, rate=dropout_keep_prob, training=is_training)
 
-    #block8 -- out 10x10x512
-    net = slim.conv2d(net, 256, [1, 1], scope='conv1x1')
-    net = pad2d(net, [1,1])
-    net = slim.conv2d(net, 512, [3, 3], stride=2, scope='conv3x3',padding='VALID')
-    end_points['block8'] = net
+        #block8 -- out 10x10x512
+        end_point = 'block8'
+        with tf.variable_scope(end_point):
+            net = slim.conv2d(net, 256, [1, 1], scope='conv1x1')
+            net = pad2d(net, [1,1])
+            net = slim.conv2d(net, 512, [3, 3], stride=2, scope='conv3x3',padding='VALID')
+            end_points['block8'] = net
 
-    #block9 -- out 5x5x256
-    net = slim.conv2d(net, 128, [1, 1], scope='conv1x1')
-    net = pad2d(net, [1,1])
-    net = slim.conv2d(net, 256, [3, 3], stride=2, scope='conv3x3', padding='VALID')
-    end_points['block9'] = net
+        #block9 -- out 5x5x256
+        end_point = 'block9'
+        with tf.variable_scope(end_point):
+            net = slim.conv2d(net, 128, [1, 1], scope='conv1x1')
+            net = pad2d(net, [1,1])
+            net = slim.conv2d(net, 256, [3, 3], stride=2, scope='conv3x3', padding='VALID')
+            end_points[end_point] = net
 
-    # block10 -- out 3x3x256
-    net = slim.conv2d(net, 128, [1, 1], scope='conv1x1')
-    net = slim.conv2d(net, 256, [3, 3], scope='conv3x3', padding='VALID')
-    end_points['block10'] = net
+        # block10 -- out 3x3x256
+        end_point = 'block10'
+        with tf.variable_scope(end_point):
+            net = slim.conv2d(net, 128, [1, 1], scope='conv1x1')
+            net = slim.conv2d(net, 256, [3, 3], scope='conv3x3', padding='VALID')
+            end_points[end_point] = net
 
-    # block11 -- out 1x1x256
-    net = slim.conv2d(net, 128, [1, 1], scope='conv1x1')
-    net = slim.conv2d(net, 256, [3, 3], scope='conv3x3', padding='VALID')
-    end_points['block11'] = net
+        # block11 -- out 1x1x256
+        end_point = 'block11'
+        with tf.variable_scope(end_point):
+            net = slim.conv2d(net, 128, [1, 1], scope='conv1x1')
+            net = slim.conv2d(net, 256, [3, 3], scope='conv3x3', padding='VALID')
+            end_points[end_point] = net
 
-    #predict
-    predictions = []
-    logits = []
-    localisations = []
-    for i,layer in enumerate(feat_layers):
-        with tf.variable_scope(layer + '_box'):
-            p,l = ssd_multibox_layer(end_points[layer], num_classes, anchor_ratios)
-            predictions.append(prediction_fn(p))
-            logits.append(p)
-            localisations.append(l)
+        #predict
+        predictions = []
+        logits = []
+        localisations = []
+        for i,layer in enumerate(feat_layers):
+            with tf.variable_scope(layer + '_box'):
+                p,l = ssd_multibox_layer(end_points[layer], num_classes, anchor_ratios[i])
+                predictions.append(prediction_fn(p))
+                logits.append(p)
+                localisations.append(l)
 
-    return predictions, localisations, logits, end_points
+        return predictions, localisations, logits, end_points
 
 #和Git 版本不一致，按原算法实现
 def Smo_L1_loss(x):
@@ -303,7 +327,7 @@ def Smo_L1_loss(x):
         r = tf.abs(x) - 0.5
     return r
 
-def loss(logits, localisations,
+def NetLoss(logits, localisations,
          gclasses, glocalisations, gscores,
          match_threshold=0.5,
          negative_ratio=3.,
@@ -390,3 +414,6 @@ def loss(logits, localisations,
         loss = Smo_L1_loss(localisations - glocalisations)
         loss = tf.div(tf.reduce_sum(loss * weights), batch_size, name='value')
         tf.losses.add_loss(loss)
+
+    loss = tf.losses.get_total_loss()
+    return loss
