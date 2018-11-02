@@ -43,9 +43,9 @@ def ssd_anchors_all_layers(img_shape,
                            dtype=np.float32):
     layers_anchors = []
     for i,lay_shape in enumerate(layers_shape):
-        anchor_box = ssd_anchor_one_layer(img_shape, lay_shape, anchor_sizes, anchor_ratios, anchor_steps, offset, dtype)
+        anchor_box = ssd_anchor_one_layer(img_shape, lay_shape, anchor_sizes[i], anchor_ratios[i], anchor_steps[i], offset, dtype)
         layers_anchors.append(anchor_box)
-    return  layers_anchors
+    return layers_anchors
 
 #实际上就是求个交并比
 def jaccard_with_anchors(bbox, anchors_layer):
@@ -104,16 +104,21 @@ def intersection_with_anchors(bbox, anchors_layer):
     vol_j = h*w
     return tf.div(vol_j, vol_anchors)
 
+#有些参数用不到，只是为了loop迭代
 def condition(i, labels):
-    r = tf.less(i, tf.shape(labels))
-    return r[0]
+    print('i :', i)
+    #为了直接用bool型
+    #r = tf.less(i, tf.shape(labels))
+    return i<len(labels)
 
 #这个函数的主要用处：获取每一层锚点框和真实样本框的交并比，当交并比大于
 #阈值的时候，就筛选出来，并通过后续遍历所有真实框，获取一个最大的交并比的锚点框的
 #位置
 def body(i, anchors_layer, labels, bboxes, num_classes, feat_labels, feat_scores,
                   feat_ymin, feat_xmin, feat_ymax, feat_xmax):
+
     label = labels[i]
+    print('label:',label)
     bbox = bboxes[i]
     jaccard_value = jaccard_with_anchors(bbox, anchors_layer)
     #其实是和上一次做比较
@@ -125,7 +130,7 @@ def body(i, anchors_layer, labels, bboxes, num_classes, feat_labels, feat_scores
 
     #如果交并比比之前大，则选出来，否则保持原值
     feat_labels = imask * label + (1-imask)*feat_labels
-    feat_scores = imask*jaccard_value + (1-imask)*feat_scores
+    feat_scores = tf.where(mask, jaccard_value, feat_scores)
 
     feat_ymin = fmask*bbox[0] + (1-fmask)*feat_ymin
     feat_xmin = fmask * bbox[1] + (1 - fmask) * feat_xmin
@@ -134,6 +139,7 @@ def body(i, anchors_layer, labels, bboxes, num_classes, feat_labels, feat_scores
 
     return [i+1, feat_labels, feat_scores, feat_ymin, feat_xmin, feat_ymax, feat_xmax]
 
+#将单个特征层锚点框进行编码操作
 def ssd_bboxes_encode_layer(labels,
                             bboxes,
                             anchors_layer,
@@ -147,11 +153,11 @@ def ssd_bboxes_encode_layer(labels,
     href = anchors_layer[2]
     wref = anchors_layer[3]
     #left top
-    ymin = yref - href/2
-    xmin = xref - wref/2
+    ymin = yref - href/2.
+    xmin = xref - wref/2.
     #right bottom
-    ymax = yref + href/2
-    xmax = xref + wref / 2
+    ymax = yref + href/2.
+    xmax = xref + wref/2.
 
     vol_anchors = href*wref
 
@@ -165,14 +171,25 @@ def ssd_bboxes_encode_layer(labels,
     feat_xmax = tf.zeros(shape, dtype)
 
     i = 0
-    [i, feat_labels, feat_scores,
-     feat_ymin, feat_xmin,
-     feat_ymax, feat_xmax] = tf.while_loop(condition, body,
-                                           [i, anchors_layer, labels,
-                                            bboxes, num_classes,
-                                            feat_labels, feat_scores,
-                                            feat_ymin, feat_xmin,
-                                            feat_ymax, feat_xmax])
+    print('condition before i type:',type(i))
+    while  condition(i, labels):
+        i , feat_labels, feat_scores, feat_ymin, feat_xmin, feat_ymax, feat_xmax = \
+            body(i, anchors_layer, labels, bboxes, num_classes, feat_labels, feat_scores,
+                  feat_ymin, feat_xmin, feat_ymax, feat_xmax)
+
+
+
+    #经过tf loop 之后i数据类型变成了tensor，原因暂时未知
+    #所以改成由python原生while实现
+    # [i, feat_labels, feat_scores,
+    #  feat_ymin, feat_xmin,
+    #  feat_ymax, feat_xmax] = tf.while_loop(condition, body,
+    #                                        [i, anchors_layer, labels,
+    #                                         bboxes, num_classes,
+    #                                         feat_labels, feat_scores,
+    #                                         feat_ymin, feat_xmin,
+    #                                         feat_ymax, feat_xmax])
+
     feat_cy = (feat_ymax + feat_ymin) / 2
     feat_cx = (feat_xmax + feat_xmin) / 2
     feat_h = feat_ymax - feat_ymin
@@ -184,6 +201,30 @@ def ssd_bboxes_encode_layer(labels,
     feat_w = tf.log(feat_w / wref) / prior_scaling[3]
     feat_localizations = tf.stack([feat_cx, feat_cy, feat_w, feat_h], axis=-1)
     return feat_labels, feat_localizations, feat_scores
+
+#对所有锚点框进行编码
+def ssd_bboxes_encode(labels,
+                      bboxes,
+                      anchors,
+                      num_classes,
+                      ignore_threshold=0.5,
+                      prior_scaling=[0.1, 0.1, 0.2, 0.2],
+                      dtype=tf.float32,
+                      scope = 'ssd_bboxes_encode'):
+    with tf.name_scope(scope):
+        target_labels = []
+        target_localizations = []
+        target_scores = []
+        for i,anchors_layer in enumerate(anchors):
+            with tf.name_scope('bboxes_encode_block_%i' % i):
+                t_labels, t_loc, t_scores = \
+                    ssd_bboxes_encode_layer(labels, bboxes, anchors_layer, num_classes,ignore_threshold, prior_scaling, dtype)
+
+                target_labels.append(t_labels)
+                target_localizations.append(target_localizations)
+                target_scores.append(t_scores)
+        return target_labels, target_localizations, target_scores
+
 
 
 def pad2d(Input, padSize):
@@ -201,7 +242,12 @@ def tensor_shape(x, rank=3):
     if x.get_shape().is_fully_defined():
         return x.get_shape().as_list()
     else:
-        static_shape = x.get_shape().with_rank(rank).as_list()
+        static_shape = x.get_shape()
+        if rank is None:
+            static_shape = static_shape.as_list()
+            rank = len(static_shape)
+        else:
+            static_shape = x.get_shape().with_rank(rank).as_list()
         dynamic_shape = tf.unstack(tf.shape(x), rank)
         return [s if s is not None else d
                 for s, d in zip(static_shape, dynamic_shape)]
@@ -336,7 +382,7 @@ def NetLoss(logits, localisations,
          scope=None):
 
     #logits保存了每一层的值
-    lshape = logits.get_shape().as_list()
+    lshape = tensor_shape(logits[0], 5)
     num_classes = lshape[-1]
     batch_size = lshape[0]
     #这里把所有的tensor进行了平铺处理，
@@ -346,7 +392,7 @@ def NetLoss(logits, localisations,
     fgscores = []
     flocalisations = []
     fglocalisations = []
-    for i in range(logits):
+    for i in range(len(logits)):
         #把每一层的b，h,w，组成一个维度
         flogits.append(tf.reshape(logits, [-1, num_classes]))
         flocalisations.append(tf.reshape(localisations, [-1, 4]))

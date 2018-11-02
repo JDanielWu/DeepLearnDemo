@@ -33,15 +33,17 @@ feat_shapes=[(38, 38), (19, 19), (10, 10), (5, 5), (3, 3), (1, 1)]
 anchor_steps=[8, 16, 32, 64, 100, 300]
 
 #获取所有的锚点框
-anchors_all = ssd_anchors_all_layers(img_shape, feat_shapes, anchor_sizes, anchor_ratios, anchor_steps)
+anchors_all = SSD_300Net.ssd_anchors_all_layers(img_shape, feat_shapes, anchor_sizes, anchor_ratios, anchor_steps)
 
 #GT筛选
-labels = 1
-bboxes = [0,0,0.1,0.2]
-g_labels, g_localizations, g_scores = ssd_bboxes_encode_layer(labels, bboxes, anchors_all, num_classes)
+labels = [0,1]
+print(labels)
+
+bboxes = [[0,0,0.1,0.2], [0.2,0.2,0.4,0.4]]
+g_labels, g_localizations, g_scores = SSD_300Net.ssd_bboxes_encode(labels, bboxes, anchors_all, num_classes)
 
 #loss
-loss = NetLoss(logits, localisations, g_labels, g_localizations, g_scores)
+loss = SSD_300Net.NetLoss(logits, localisations, g_labels, g_localizations, g_scores)
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
