@@ -11,4 +11,4 @@ Input = tf.expand_dims(Input, 0)
 
 vgg_net = FRCNN.VGG16BaseNet(Input)
 
-FRCNN.RPNNet(vgg_net)
+boxes, scores = FRCNN.RPNNet(vgg_net)
